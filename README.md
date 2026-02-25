@@ -135,6 +135,15 @@ CloudCLI UI is the open source UI layer that powers CloudCLI Cloud. You can self
 
 **🔒 Important Notice**: All Claude Code tools are **disabled by default**. This prevents potentially harmful operations from running automatically.
 
+### Server Security Environment
+
+This fork intentionally fails closed unless `JWT_SECRET` is set to a strong unique value. It also supports httpOnly
+cookie auth, a CORS allowlist, and an explicit `PLATFORM_BYPASS_KEY` gate for platform deployments. Copy
+`.env.example`, set the security variables there, and keep `ALLOW_LEGACY_QUERY_TOKEN` disabled unless an old
+EventSource integration still requires query-string tokens.
+
+For Tailscale-only deployments, see [`tailscale_userguide.md`](./tailscale_userguide.md).
+
 ### Enabling Tools
 
 To use Claude Code's full functionality, you'll need to manually enable tools:

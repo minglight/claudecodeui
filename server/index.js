@@ -77,6 +77,28 @@ const __dirname = getModuleDir(import.meta.url);
 // Resolving the app root once keeps every repo-level lookup below aligned across both layouts.
 const APP_ROOT = findAppRoot(__dirname);
 const installMode = fs.existsSync(path.join(APP_ROOT, '.git')) ? 'git' : 'npm';
+const DEFAULT_CORS_ORIGINS = [
+    'http://localhost:3001',
+    'http://127.0.0.1:3001',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+];
+const configuredCorsOrigins = (process.env.CORS_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(Boolean);
+const allowedCorsOrigins = new Set([...DEFAULT_CORS_ORIGINS, ...configuredCorsOrigins]);
+const corsOptions = {
+    credentials: true,
+    exposedHeaders: ['X-Refreshed-Token'],
+    origin(origin, callback) {
+        if (!origin || allowedCorsOrigins.has(origin)) {
+            callback(null, true);
+            return;
+        }
+        callback(null, false);
+    },
+};
 
 console.log('SERVER_PORT from env:', process.env.SERVER_PORT);
 
@@ -123,7 +145,7 @@ const wss = createWebSocketServer(server, {
 // Make WebSocket server available to routes
 app.locals.wss = wss;
 
-app.use(cors({ exposedHeaders: ['X-Refreshed-Token'] }));
+app.use(cors(corsOptions));
 app.use(express.json({
     limit: '50mb',
     type: (req) => {
@@ -606,11 +628,14 @@ app.get('/api/projects/:projectId/files', authenticateToken, async (req, res) =>
  * @returns {{ valid: boolean, resolved?: string, error?: string }}
  */
 function validatePathInProject(projectRoot, targetPath) {
+    if (typeof targetPath !== 'string' || targetPath.includes('\0')) {
+        return { valid: false, error: 'Invalid path' };
+    }
+    const normalizedRoot = path.resolve(projectRoot);
     const resolved = path.isAbsolute(targetPath)
         ? path.resolve(targetPath)
         : path.resolve(projectRoot, targetPath);
-    const normalizedRoot = path.resolve(projectRoot) + path.sep;
-    if (!resolved.startsWith(normalizedRoot)) {
+    if (resolved !== normalizedRoot && !resolved.startsWith(`${normalizedRoot}${path.sep}`)) {
         return { valid: false, error: 'Path must be under project root' };
     }
     return { valid: true, resolved };

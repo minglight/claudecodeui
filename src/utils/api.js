@@ -16,6 +16,7 @@ export const authenticatedFetch = (url, options = {}) => {
   }
 
   return fetch(url, {
+    credentials: 'include',
     ...options,
     headers: {
       ...defaultHeaders,
@@ -26,6 +27,20 @@ export const authenticatedFetch = (url, options = {}) => {
     if (refreshedToken) {
       localStorage.setItem('auth-token', refreshedToken);
     }
+    if (response.status === 401 || response.status === 403) {
+      try {
+        localStorage.removeItem('auth-token');
+        sessionStorage.setItem('authError', 'Session expired, please sign in again.');
+      } catch {
+        // Ignore storage errors.
+      }
+
+      if (!window.location.pathname.includes('/login')) {
+        window.location.href = '/login';
+      }
+
+      throw new Error('Unauthorized or expired session');
+    }
     return response;
   });
 };
@@ -34,14 +49,16 @@ export const authenticatedFetch = (url, options = {}) => {
 export const api = {
   // Auth endpoints (no token required)
   auth: {
-    status: () => fetch('/api/auth/status'),
+    status: () => fetch('/api/auth/status', { credentials: 'include' }),
     login: (username, password) => fetch('/api/auth/login', {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     }),
     register: (username, password) => fetch('/api/auth/register', {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     }),

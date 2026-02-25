@@ -15,6 +15,28 @@ const APP_ROOT = findAppRoot(__dirname);
 
 const router = express.Router();
 
+function shellEscape(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function applyArgumentReplacement(commandContent, args) {
+  return commandContent
+    .split('\n')
+    .map((line) => {
+      const isShellLine = line.trimStart().startsWith('!');
+      const replacements = args.map((arg) => (isShellLine ? shellEscape(arg) : arg));
+      let processedLine = line.replace(/\$ARGUMENTS/g, replacements.join(' '));
+
+      replacements.forEach((arg, index) => {
+        const placeholder = `$${index + 1}`;
+        processedLine = processedLine.replace(new RegExp(`\\${placeholder}\\b`, 'g'), arg);
+      });
+
+      return processedLine;
+    })
+    .join('\n');
+}
+
 /**
  * Recursively scan directory for command files (.md)
  * @param {string} dir - Directory to scan
@@ -516,18 +538,7 @@ router.post('/execute', async (req, res) => {
     }
     const content = await fs.readFile(commandPath, 'utf8');
     const { data: metadata, content: commandContent } = parseFrontMatter(content);
-    // Basic argument replacement (will be enhanced in command parser utility)
-    let processedContent = commandContent;
-
-    // Replace $ARGUMENTS with all arguments joined
-    const argsString = args.join(' ');
-    processedContent = processedContent.replace(/\$ARGUMENTS/g, argsString);
-
-    // Replace $1, $2, etc. with positional arguments
-    args.forEach((arg, index) => {
-      const placeholder = `$${index + 1}`;
-      processedContent = processedContent.replace(new RegExp(`\\${placeholder}\\b`, 'g'), arg);
-    });
+    const processedContent = applyArgumentReplacement(commandContent, args);
 
     res.json({
       type: 'custom',

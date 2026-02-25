@@ -49,14 +49,30 @@ function spawnAsync(command, args, options = {}) {
 // Input validation helpers (defense-in-depth)
 function validateCommitRef(commit) {
   // Allow hex hashes, HEAD, HEAD~N, HEAD^N, tag names, branch names
-  if (!/^[a-zA-Z0-9._~^{}@\/-]+$/.test(commit)) {
+  if (
+    typeof commit !== 'string'
+    || commit.startsWith('-')
+    || commit.includes('\0')
+    || !/^[a-zA-Z0-9._~^{}@\/-]+$/.test(commit)
+  ) {
     throw new Error('Invalid commit reference');
   }
   return commit;
 }
 
 function validateBranchName(branch) {
-  if (!/^[a-zA-Z0-9._\/-]+$/.test(branch)) {
+  if (
+    typeof branch !== 'string'
+    || !branch.trim()
+    || branch.startsWith('-')
+    || branch.includes('..')
+    || branch.includes('@{')
+    || branch.includes('//')
+    || branch.endsWith('/')
+    || branch.endsWith('.')
+    || branch.includes('\0')
+    || !/^[a-zA-Z0-9._\/-]+$/.test(branch)
+  ) {
     throw new Error('Invalid branch name');
   }
   return branch;
@@ -217,11 +233,29 @@ async function getRepositoryRootPath(projectPath) {
 }
 
 function normalizeRepositoryRelativeFilePath(filePath) {
-  return String(filePath)
+  const rawPath = String(filePath).replace(/\\/g, '/').trim();
+  if (
+    !rawPath
+    || rawPath.startsWith('/')
+    || /^[a-zA-Z]:\//.test(rawPath)
+    || rawPath.includes('\0')
+  ) {
+    throw new Error('Invalid file path');
+  }
+
+  const normalizedPath = path.posix.normalize(rawPath.replace(/^\.\/+/, ''));
+  if (
+    normalizedPath === '.'
+    || normalizedPath === '..'
+    || normalizedPath.startsWith('../')
+    || normalizedPath.includes('/../')
+  ) {
+    throw new Error('Invalid file path: path traversal detected');
+  }
+
+  return normalizedPath
     .replace(/\\/g, '/')
-    .replace(/^\.\/+/, '')
-    .replace(/^\/+/, '')
-    .trim();
+    .replace(/^\.\/+/, '');
 }
 
 function parseStatusFilePaths(statusOutput) {

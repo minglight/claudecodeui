@@ -4,7 +4,7 @@ import type { AuthenticatedWebSocketRequest } from '@/shared/types.js';
 
 type WebSocketAuthDependencies = {
   isPlatform: boolean;
-  authenticateWebSocket: (token: string | null) => {
+  authenticateWebSocket: (request: AuthenticatedWebSocketRequest) => {
     id?: string | number;
     userId?: string | number;
     username?: string;
@@ -22,27 +22,7 @@ export function verifyWebSocketClient(
   const request = info.req as AuthenticatedWebSocketRequest;
   console.log('WebSocket connection attempt to:', request.url);
 
-  // Platform mode: use the first DB user and skip token checks.
-  if (dependencies.isPlatform) {
-    const user = dependencies.authenticateWebSocket(null);
-    if (!user) {
-      console.log('[WARN] Platform mode: No user found in database');
-      return false;
-    }
-
-    request.user = user;
-    console.log('[OK] Platform mode WebSocket authenticated for user:', user.username);
-    return true;
-  }
-
-  // OSS mode: read JWT from query string first, then Authorization header.
-  const upgradeUrl = new URL(request.url ?? '/', 'http://localhost');
-  const token =
-    upgradeUrl.searchParams.get('token') ??
-    request.headers.authorization?.split(' ')[1] ??
-    null;
-
-  const user = dependencies.authenticateWebSocket(token);
+  const user = dependencies.authenticateWebSocket(request);
   if (!user) {
     console.log('[WARN] WebSocket authentication failed');
     return false;
