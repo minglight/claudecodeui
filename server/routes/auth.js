@@ -1,7 +1,7 @@
 import express from 'express';
 import bcrypt from 'bcrypt';
 import { userDb, db } from '../database/db.js';
-import { generateToken, authenticateToken } from '../middleware/auth.js';
+import { generateToken, authenticateToken, setAuthCookie, clearAuthCookie } from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -58,6 +58,8 @@ router.post('/register', async (req, res) => {
       // Update last login (non-fatal, outside transaction)
       userDb.updateLastLogin(user.id);
 
+      setAuthCookie(res, token);
+
       res.json({
         success: true,
         user: { id: user.id, username: user.username },
@@ -105,6 +107,8 @@ router.post('/login', async (req, res) => {
     
     // Update last login
     userDb.updateLastLogin(user.id);
+
+    setAuthCookie(res, token);
     
     res.json({
       success: true,
@@ -127,8 +131,7 @@ router.get('/user', authenticateToken, (req, res) => {
 
 // Logout (client-side token removal, but this endpoint can be used for logging)
 router.post('/logout', authenticateToken, (req, res) => {
-  // In a simple JWT system, logout is mainly client-side
-  // This endpoint exists for consistency and potential future logging
+  clearAuthCookie(res);
   res.json({ success: true, message: 'Logged out successfully' });
 });
 

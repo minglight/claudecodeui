@@ -3,7 +3,7 @@ import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import { promises as fs } from 'fs';
-import { extractProjectDirectory } from '../projects.js';
+import { extractProjectDirectory, decodeProjectNameToPath } from '../projects.js';
 import { queryClaudeSDK } from '../claude-sdk.js';
 import { spawnCursor } from '../cursor-cli.js';
 
@@ -47,14 +47,39 @@ function spawnAsync(command, args, options = {}) {
   });
 }
 
+async function runGit(projectPath, args) {
+  return spawnAsync('git', args, { cwd: projectPath });
+}
+
+async function assertValidBranchName(projectPath, branch) {
+  if (typeof branch !== 'string' || !branch.trim()) {
+    throw new Error('Branch name is required');
+  }
+
+  await runGit(projectPath, ['check-ref-format', '--branch', branch]);
+}
+
+function resolvePathInsideProject(projectPath, targetPath) {
+  if (typeof targetPath !== 'string' || !targetPath.trim()) {
+    throw new Error('File path is required');
+  }
+
+  const normalizedRoot = path.resolve(projectPath);
+  const resolved = path.resolve(projectPath, targetPath);
+  if (resolved !== normalizedRoot && !resolved.startsWith(`${normalizedRoot}${path.sep}`)) {
+    throw new Error(`Path traversal detected: ${targetPath}`);
+  }
+
+  return resolved;
+}
+
 // Helper function to get the actual project path from the encoded project name
 async function getActualProjectPath(projectName) {
   try {
     return await extractProjectDirectory(projectName);
   } catch (error) {
     console.error(`Error extracting project directory for ${projectName}:`, error);
-    // Fallback to the old method
-    return projectName.replace(/-/g, '/');
+    return decodeProjectNameToPath(projectName);
   }
 }
 
@@ -202,7 +227,7 @@ router.get('/diff', async (req, res) => {
     await validateGitRepository(projectPath);
     
     // Check if file is untracked or deleted
-    const { stdout: statusOutput } = await execAsync(`git status --porcelain "${file}"`, { cwd: projectPath });
+    const { stdout: statusOutput } = await runGit(projectPath, ['status', '--porcelain', '--', file]);
     const isUntracked = statusOutput.startsWith('??');
     const isDeleted = statusOutput.trim().startsWith('D ') || statusOutput.trim().startsWith(' D');
 
@@ -223,21 +248,21 @@ router.get('/diff', async (req, res) => {
       }
     } else if (isDeleted) {
       // For deleted files, show the entire file content from HEAD as deletions
-      const { stdout: fileContent } = await execAsync(`git show HEAD:"${file}"`, { cwd: projectPath });
+      const { stdout: fileContent } = await runGit(projectPath, ['show', `HEAD:${file}`]);
       const lines = fileContent.split('\n');
       diff = `--- a/${file}\n+++ /dev/null\n@@ -1,${lines.length} +0,0 @@\n` +
              lines.map(line => `-${line}`).join('\n');
     } else {
       // Get diff for tracked files
       // First check for unstaged changes (working tree vs index)
-      const { stdout: unstagedDiff } = await execAsync(`git diff -- "${file}"`, { cwd: projectPath });
+      const { stdout: unstagedDiff } = await runGit(projectPath, ['diff', '--', file]);
 
       if (unstagedDiff) {
         // Show unstaged changes if they exist
         diff = stripDiffHeaders(unstagedDiff);
       } else {
         // If no unstaged changes, check for staged changes (index vs HEAD)
-        const { stdout: stagedDiff } = await execAsync(`git diff --cached -- "${file}"`, { cwd: projectPath });
+        const { stdout: stagedDiff } = await runGit(projectPath, ['diff', '--cached', '--', file]);
         diff = stripDiffHeaders(stagedDiff) || '';
       }
     }
@@ -264,7 +289,7 @@ router.get('/file-with-diff', async (req, res) => {
     await validateGitRepository(projectPath);
 
     // Check file status
-    const { stdout: statusOutput } = await execAsync(`git status --porcelain "${file}"`, { cwd: projectPath });
+    const { stdout: statusOutput } = await runGit(projectPath, ['status', '--porcelain', '--', file]);
     const isUntracked = statusOutput.startsWith('??');
     const isDeleted = statusOutput.trim().startsWith('D ') || statusOutput.trim().startsWith(' D');
 
@@ -273,12 +298,12 @@ router.get('/file-with-diff', async (req, res) => {
 
     if (isDeleted) {
       // For deleted files, get content from HEAD
-      const { stdout: headContent } = await execAsync(`git show HEAD:"${file}"`, { cwd: projectPath });
+      const { stdout: headContent } = await runGit(projectPath, ['show', `HEAD:${file}`]);
       oldContent = headContent;
       currentContent = headContent; // Show the deleted content in editor
     } else {
       // Get current file content
-      const filePath = path.join(projectPath, file);
+      const filePath = resolvePathInsideProject(projectPath, file);
       const stats = await fs.stat(filePath);
 
       if (stats.isDirectory()) {
@@ -291,7 +316,7 @@ router.get('/file-with-diff', async (req, res) => {
       if (!isUntracked) {
         // Get the old content from HEAD for tracked files
         try {
-          const { stdout: headContent } = await execAsync(`git show HEAD:"${file}"`, { cwd: projectPath });
+          const { stdout: headContent } = await runGit(projectPath, ['show', `HEAD:${file}`]);
           oldContent = headContent;
         } catch (error) {
           // File might be newly added to git (staged but not committed)
@@ -372,11 +397,11 @@ router.post('/commit', async (req, res) => {
     
     // Stage selected files
     for (const file of files) {
-      await execAsync(`git add "${file}"`, { cwd: projectPath });
+      await runGit(projectPath, ['add', '--', file]);
     }
     
     // Commit with message
-    const { stdout } = await execAsync(`git commit -m "${message.replace(/"/g, '\\"')}"`, { cwd: projectPath });
+    const { stdout } = await runGit(projectPath, ['commit', '-m', message]);
     
     res.json({ success: true, output: stdout });
   } catch (error) {
@@ -437,9 +462,11 @@ router.post('/checkout', async (req, res) => {
 
   try {
     const projectPath = await getActualProjectPath(project);
+
+    await assertValidBranchName(projectPath, branch);
     
     // Checkout the branch
-    const { stdout } = await execAsync(`git checkout "${branch}"`, { cwd: projectPath });
+    const { stdout } = await runGit(projectPath, ['checkout', branch]);
     
     res.json({ success: true, output: stdout });
   } catch (error) {
@@ -458,9 +485,11 @@ router.post('/create-branch', async (req, res) => {
 
   try {
     const projectPath = await getActualProjectPath(project);
+
+    await assertValidBranchName(projectPath, branch);
     
     // Create and checkout new branch
-    const { stdout } = await execAsync(`git checkout -b "${branch}"`, { cwd: projectPath });
+    const { stdout } = await runGit(projectPath, ['checkout', '-b', branch]);
     
     res.json({ success: true, output: stdout });
   } catch (error) {
@@ -509,10 +538,7 @@ router.get('/commits', async (req, res) => {
     // Get stats for each commit
     for (const commit of commits) {
       try {
-        const { stdout: stats } = await execAsync(
-          `git show --stat --format='' ${commit.hash}`,
-          { cwd: projectPath }
-        );
+        const { stdout: stats } = await runGit(projectPath, ['show', '--stat', '--format=', commit.hash]);
         commit.stats = stats.trim().split('\n').pop(); // Get the summary line
       } catch (error) {
         commit.stats = '';
@@ -538,10 +564,7 @@ router.get('/commit-diff', async (req, res) => {
     const projectPath = await getActualProjectPath(project);
     
     // Get diff for the commit
-    const { stdout } = await execAsync(
-      `git show ${commit}`,
-      { cwd: projectPath }
-    );
+    const { stdout } = await runGit(projectPath, ['show', commit]);
     
     res.json({ diff: stdout });
   } catch (error) {
@@ -570,10 +593,7 @@ router.post('/generate-commit-message', async (req, res) => {
     let diffContext = '';
     for (const file of files) {
       try {
-        const { stdout } = await execAsync(
-          `git diff HEAD -- "${file}"`,
-          { cwd: projectPath }
-        );
+        const { stdout } = await runGit(projectPath, ['diff', 'HEAD', '--', file]);
         if (stdout) {
           diffContext += `\n--- ${file} ---\n${stdout}`;
         }
@@ -587,7 +607,7 @@ router.post('/generate-commit-message', async (req, res) => {
       // Try to get content of untracked files
       for (const file of files) {
         try {
-          const filePath = path.join(projectPath, file);
+          const filePath = resolvePathInsideProject(projectPath, file);
           const stats = await fs.stat(filePath);
 
           if (!stats.isDirectory()) {
@@ -771,7 +791,7 @@ router.get('/remote-status', async (req, res) => {
     let trackingBranch;
     let remoteName;
     try {
-      const { stdout } = await execAsync(`git rev-parse --abbrev-ref ${branch}@{upstream}`, { cwd: projectPath });
+      const { stdout } = await runGit(projectPath, ['rev-parse', '--abbrev-ref', `${branch}@{upstream}`]);
       trackingBranch = stdout.trim();
       remoteName = trackingBranch.split('/')[0]; // Extract remote name (e.g., "origin/main" -> "origin")
     } catch (error) {
@@ -799,10 +819,7 @@ router.get('/remote-status', async (req, res) => {
     }
 
     // Get ahead/behind counts
-    const { stdout: countOutput } = await execAsync(
-      `git rev-list --count --left-right ${trackingBranch}...HEAD`,
-      { cwd: projectPath }
-    );
+    const { stdout: countOutput } = await runGit(projectPath, ['rev-list', '--count', '--left-right', `${trackingBranch}...HEAD`]);
     
     const [behind, ahead] = countOutput.trim().split('\t').map(Number);
 
@@ -840,14 +857,14 @@ router.post('/fetch', async (req, res) => {
 
     let remoteName = 'origin'; // fallback
     try {
-      const { stdout } = await execAsync(`git rev-parse --abbrev-ref ${branch}@{upstream}`, { cwd: projectPath });
+      const { stdout } = await runGit(projectPath, ['rev-parse', '--abbrev-ref', `${branch}@{upstream}`]);
       remoteName = stdout.trim().split('/')[0]; // Extract remote name
     } catch (error) {
       // No upstream, try to fetch from origin anyway
       console.log('No upstream configured, using origin as fallback');
     }
 
-    const { stdout } = await execAsync(`git fetch ${remoteName}`, { cwd: projectPath });
+    const { stdout } = await runGit(projectPath, ['fetch', remoteName]);
     
     res.json({ success: true, output: stdout || 'Fetch completed successfully', remoteName });
   } catch (error) {
@@ -882,7 +899,7 @@ router.post('/pull', async (req, res) => {
     let remoteName = 'origin'; // fallback
     let remoteBranch = branch; // fallback
     try {
-      const { stdout } = await execAsync(`git rev-parse --abbrev-ref ${branch}@{upstream}`, { cwd: projectPath });
+      const { stdout } = await runGit(projectPath, ['rev-parse', '--abbrev-ref', `${branch}@{upstream}`]);
       const tracking = stdout.trim();
       remoteName = tracking.split('/')[0]; // Extract remote name
       remoteBranch = tracking.split('/').slice(1).join('/'); // Extract branch name
@@ -891,7 +908,7 @@ router.post('/pull', async (req, res) => {
       console.log('No upstream configured, using origin/branch as fallback');
     }
 
-    const { stdout } = await execAsync(`git pull ${remoteName} ${remoteBranch}`, { cwd: projectPath });
+    const { stdout } = await runGit(projectPath, ['pull', remoteName, remoteBranch]);
     
     res.json({ 
       success: true, 
@@ -949,7 +966,7 @@ router.post('/push', async (req, res) => {
     let remoteName = 'origin'; // fallback
     let remoteBranch = branch; // fallback
     try {
-      const { stdout } = await execAsync(`git rev-parse --abbrev-ref ${branch}@{upstream}`, { cwd: projectPath });
+      const { stdout } = await runGit(projectPath, ['rev-parse', '--abbrev-ref', `${branch}@{upstream}`]);
       const tracking = stdout.trim();
       remoteName = tracking.split('/')[0]; // Extract remote name
       remoteBranch = tracking.split('/').slice(1).join('/'); // Extract branch name
@@ -958,7 +975,7 @@ router.post('/push', async (req, res) => {
       console.log('No upstream configured, using origin/branch as fallback');
     }
 
-    const { stdout } = await execAsync(`git push ${remoteName} ${remoteBranch}`, { cwd: projectPath });
+    const { stdout } = await runGit(projectPath, ['push', remoteName, remoteBranch]);
     
     res.json({ 
       success: true, 
@@ -1011,6 +1028,7 @@ router.post('/publish', async (req, res) => {
   try {
     const projectPath = await getActualProjectPath(project);
     await validateGitRepository(projectPath);
+    await assertValidBranchName(projectPath, branch);
 
     // Get current branch to verify it matches the requested branch
     const { stdout: currentBranch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
@@ -1040,7 +1058,7 @@ router.post('/publish', async (req, res) => {
     }
 
     // Publish the branch (set upstream and push)
-    const { stdout } = await execAsync(`git push --set-upstream ${remoteName} ${branch}`, { cwd: projectPath });
+    const { stdout } = await runGit(projectPath, ['push', '--set-upstream', remoteName, branch]);
     
     res.json({ 
       success: true, 
@@ -1089,7 +1107,7 @@ router.post('/discard', async (req, res) => {
     await validateGitRepository(projectPath);
 
     // Check file status to determine correct discard command
-    const { stdout: statusOutput } = await execAsync(`git status --porcelain "${file}"`, { cwd: projectPath });
+    const { stdout: statusOutput } = await runGit(projectPath, ['status', '--porcelain', '--', file]);
     
     if (!statusOutput.trim()) {
       return res.status(400).json({ error: 'No changes to discard for this file' });
@@ -1099,7 +1117,7 @@ router.post('/discard', async (req, res) => {
 
     if (status === '??') {
       // Untracked file or directory - delete it
-      const filePath = path.join(projectPath, file);
+      const filePath = resolvePathInsideProject(projectPath, file);
       const stats = await fs.stat(filePath);
 
       if (stats.isDirectory()) {
@@ -1109,10 +1127,10 @@ router.post('/discard', async (req, res) => {
       }
     } else if (status.includes('M') || status.includes('D')) {
       // Modified or deleted file - restore from HEAD
-      await execAsync(`git restore "${file}"`, { cwd: projectPath });
+      await runGit(projectPath, ['restore', '--', file]);
     } else if (status.includes('A')) {
       // Added file - unstage it
-      await execAsync(`git reset HEAD "${file}"`, { cwd: projectPath });
+      await runGit(projectPath, ['reset', 'HEAD', '--', file]);
     }
     
     res.json({ success: true, message: `Changes discarded for ${file}` });
@@ -1135,7 +1153,7 @@ router.post('/delete-untracked', async (req, res) => {
     await validateGitRepository(projectPath);
 
     // Check if file is actually untracked
-    const { stdout: statusOutput } = await execAsync(`git status --porcelain "${file}"`, { cwd: projectPath });
+    const { stdout: statusOutput } = await runGit(projectPath, ['status', '--porcelain', '--', file]);
     
     if (!statusOutput.trim()) {
       return res.status(400).json({ error: 'File is not untracked or does not exist' });
@@ -1148,7 +1166,7 @@ router.post('/delete-untracked', async (req, res) => {
     }
 
     // Delete the untracked file or directory
-    const filePath = path.join(projectPath, file);
+    const filePath = resolvePathInsideProject(projectPath, file);
     const stats = await fs.stat(filePath);
 
     if (stats.isDirectory()) {

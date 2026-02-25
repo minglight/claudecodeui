@@ -44,7 +44,7 @@ import pty from 'node-pty';
 import fetch from 'node-fetch';
 import mime from 'mime-types';
 
-import { getProjects, getSessions, getSessionMessages, renameProject, deleteSession, deleteProject, addProjectManually, extractProjectDirectory, clearProjectDirectoryCache } from './projects.js';
+import { getProjects, getSessions, getSessionMessages, renameProject, deleteSession, deleteProject, addProjectManually, extractProjectDirectory, decodeProjectNameToPath, clearProjectDirectoryCache } from './projects.js';
 import { queryClaudeSDK, abortClaudeSDKSession, isClaudeSDKSessionActive, getActiveClaudeSDKSessions, resolveToolApproval } from './claude-sdk.js';
 import { spawnCursor, abortCursorSession, isCursorSessionActive, getActiveCursorSessions } from './cursor-cli.js';
 import { queryCodex, abortCodexSession, isCodexSessionActive, getActiveCodexSessions } from './openai-codex.js';
@@ -63,7 +63,6 @@ import userRoutes from './routes/user.js';
 import codexRoutes from './routes/codex.js';
 import { initializeDatabase } from './database/db.js';
 import { validateApiKey, authenticateToken, authenticateWebSocket } from './middleware/auth.js';
-import { IS_PLATFORM } from './constants/config.js';
 
 // File system watchers for provider project/session folders
 const PROVIDER_WATCH_PATHS = [
@@ -215,6 +214,44 @@ const PTY_SESSION_TIMEOUT = 30 * 60 * 1000;
 const SHELL_URL_PARSE_BUFFER_LIMIT = 32768;
 const ANSI_ESCAPE_SEQUENCE_REGEX = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g;
 const TRAILING_URL_PUNCTUATION_REGEX = /[)\]}>.,;:!?]+$/;
+const DEFAULT_CORS_ORIGINS = [
+    'http://localhost:3001',
+    'http://127.0.0.1:3001',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+];
+const configuredCorsOrigins = (process.env.CORS_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(Boolean);
+const allowedCorsOrigins = new Set([...DEFAULT_CORS_ORIGINS, ...configuredCorsOrigins]);
+const PTY_ALLOWED_ENV_KEYS = [
+    'PATH',
+    'HOME',
+    'USER',
+    'LOGNAME',
+    'SHELL',
+    'LANG',
+    'LC_ALL',
+    'LC_CTYPE',
+    'TERM_PROGRAM',
+    'TMPDIR',
+    'TEMP',
+    'TMP',
+    'SystemRoot',
+    'ComSpec',
+    'WINDIR',
+    'PATHEXT',
+    'APPDATA',
+    'LOCALAPPDATA',
+    'ProgramFiles',
+    'ProgramFiles(x86)',
+    'ProgramW6432',
+    'HOMEDRIVE',
+    'HOMEPATH',
+    'USERNAME',
+    'USERPROFILE'
+];
 
 function stripAnsiSequences(value = '') {
     return value.replace(ANSI_ESCAPE_SEQUENCE_REGEX, '');
@@ -276,32 +313,29 @@ function shouldAutoOpenUrlFromOutput(value = '') {
     );
 }
 
+function buildPtyEnvironment() {
+    const env = {};
+
+    for (const key of PTY_ALLOWED_ENV_KEYS) {
+        if (process.env[key]) {
+            env[key] = process.env[key];
+        }
+    }
+
+    return {
+        ...env,
+        TERM: 'xterm-256color',
+        COLORTERM: 'truecolor',
+        FORCE_COLOR: '3'
+    };
+}
+
 // Single WebSocket server that handles both paths
 const wss = new WebSocketServer({
     server,
     verifyClient: (info) => {
         console.log('WebSocket connection attempt to:', info.req.url);
-
-        // Platform mode: always allow connection
-        if (IS_PLATFORM) {
-            const user = authenticateWebSocket(null); // Will return first user
-            if (!user) {
-                console.log('[WARN] Platform mode: No user found in database');
-                return false;
-            }
-            info.req.user = user;
-            console.log('[OK] Platform mode WebSocket authenticated for user:', user.username);
-            return true;
-        }
-
-        // Normal mode: verify token
-        // Extract token from query parameters or headers
-        const url = new URL(info.req.url, 'http://localhost');
-        const token = url.searchParams.get('token') ||
-            info.req.headers.authorization?.split(' ')[1];
-
-        // Verify token
-        const user = authenticateWebSocket(token);
+        const user = authenticateWebSocket(info.req);
         if (!user) {
             console.log('[WARN] WebSocket authentication failed');
             return false;
@@ -317,7 +351,22 @@ const wss = new WebSocketServer({
 // Make WebSocket server available to routes
 app.locals.wss = wss;
 
-app.use(cors());
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin) {
+            callback(null, true);
+            return;
+        }
+
+        if (allowedCorsOrigins.has(origin)) {
+            callback(null, true);
+            return;
+        }
+
+        callback(null, false);
+    },
+    credentials: true
+}));
 app.use(express.json({
   limit: '50mb',
   type: (req) => {
@@ -847,17 +896,12 @@ app.put('/api/projects/:projectName/file', authenticateToken, async (req, res) =
 
 app.get('/api/projects/:projectName/files', authenticateToken, async (req, res) => {
     try {
-
-        // Using fsPromises from import
-
-        // Use extractProjectDirectory to get the actual project path
         let actualPath;
         try {
             actualPath = await extractProjectDirectory(req.params.projectName);
         } catch (error) {
             console.error('Error extracting project directory:', error);
-            // Fallback to simple dash replacement
-            actualPath = req.params.projectName.replace(/-/g, '/');
+            actualPath = decodeProjectNameToPath(req.params.projectName);
         }
 
         // Check if path exists
@@ -868,7 +912,6 @@ app.get('/api/projects/:projectName/files', authenticateToken, async (req, res) 
         }
 
         const files = await getFileTree(actualPath, 10, 0, true);
-        const hiddenFiles = files.filter(f => f.name.startsWith('.'));
         res.json(files);
     } catch (error) {
         console.error('[ERROR] File tree error:', error.message);
@@ -1226,12 +1269,7 @@ function handleShellConnection(ws) {
                         cols: termCols,
                         rows: termRows,
                         cwd: os.homedir(),
-                        env: {
-                            ...process.env,
-                            TERM: 'xterm-256color',
-                            COLORTERM: 'truecolor',
-                            FORCE_COLOR: '3'
-                        }
+                        env: buildPtyEnvironment()
                     });
 
                     console.log('🟢 Shell process started with PTY, PID:', shellProcess.pid);

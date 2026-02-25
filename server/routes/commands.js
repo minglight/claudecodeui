@@ -11,6 +11,34 @@ const __dirname = path.dirname(__filename);
 
 const router = express.Router();
 
+function shellEscape(value = '') {
+  const asString = String(value);
+  if (!asString) return "''";
+  return `'${asString.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function applyArgumentReplacement(content, args = []) {
+  const argsArray = Array.isArray(args) ? args.map(arg => String(arg)) : [];
+  const rawArguments = argsArray.join(' ');
+  const escapedArguments = argsArray.map(shellEscape).join(' ');
+
+  return content
+    .split('\n')
+    .map((line) => {
+      const isShellLine = /^\s*!/.test(line);
+      const allArgsValue = isShellLine ? escapedArguments : rawArguments;
+
+      let replacedLine = line.replace(/\$ARGUMENTS/g, allArgsValue);
+      argsArray.forEach((arg, index) => {
+        const placeholder = new RegExp(`\\$${index + 1}\\b`, 'g');
+        replacedLine = replacedLine.replace(placeholder, isShellLine ? shellEscape(arg) : arg);
+      });
+
+      return replacedLine;
+    })
+    .join('\n');
+}
+
 /**
  * Recursively scan directory for command files (.md)
  * @param {string} dir - Directory to scan
@@ -561,18 +589,8 @@ router.post('/execute', async (req, res) => {
     }
     const content = await fs.readFile(commandPath, 'utf8');
     const { data: metadata, content: commandContent } = matter(content);
-    // Basic argument replacement (will be enhanced in command parser utility)
-    let processedContent = commandContent;
-
-    // Replace $ARGUMENTS with all arguments joined
-    const argsString = args.join(' ');
-    processedContent = processedContent.replace(/\$ARGUMENTS/g, argsString);
-
-    // Replace $1, $2, etc. with positional arguments
-    args.forEach((arg, index) => {
-      const placeholder = `$${index + 1}`;
-      processedContent = processedContent.replace(new RegExp(`\\${placeholder}\\b`, 'g'), arg);
-    });
+    // Replace placeholders. Shell command lines (`!cmd`) use escaped arguments.
+    const processedContent = applyArgumentReplacement(commandContent, args);
 
     res.json({
       type: 'custom',

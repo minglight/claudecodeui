@@ -197,6 +197,40 @@ async function detectTaskMasterFolder(projectPath) {
 // Cache for extracted project directories
 const projectDirectoryCache = new Map();
 
+function getAllowedProjectRoots() {
+  const roots = [path.resolve(os.homedir())];
+
+  if (process.env.WORKSPACES_ROOT) {
+    roots.push(path.resolve(process.env.WORKSPACES_ROOT));
+  }
+
+  return Array.from(new Set(roots));
+}
+
+function ensurePathWithinAllowedRoots(candidatePath) {
+  const resolvedPath = path.resolve(candidatePath);
+  const allowedRoots = getAllowedProjectRoots();
+
+  const isAllowed = allowedRoots.some((root) => {
+    return resolvedPath === root || resolvedPath.startsWith(`${root}${path.sep}`);
+  });
+
+  if (!isAllowed) {
+    throw new Error(`Path traversal detected: ${candidatePath}`);
+  }
+
+  return resolvedPath;
+}
+
+function decodeProjectNameToPath(projectName) {
+  const decodedPath = projectName.replace(/-/g, '/');
+  if (!path.isAbsolute(decodedPath)) {
+    throw new Error(`Invalid encoded project path: ${projectName}`);
+  }
+
+  return ensurePathWithinAllowedRoots(decodedPath);
+}
+
 // Clear cache when needed (called when project files change)
 function clearProjectDirectoryCache() {
   projectDirectoryCache.clear();
@@ -271,7 +305,7 @@ async function extractProjectDirectory(projectName) {
   // This handles projects with dashes in their directory names correctly
   const config = await loadProjectConfig();
   if (config[projectName]?.originalPath) {
-    const originalPath = config[projectName].originalPath;
+    const originalPath = ensurePathWithinAllowedRoots(config[projectName].originalPath);
     projectDirectoryCache.set(projectName, originalPath);
     return originalPath;
   }
@@ -291,7 +325,7 @@ async function extractProjectDirectory(projectName) {
     
     if (jsonlFiles.length === 0) {
       // Fall back to decoded project name if no sessions
-      extractedPath = projectName.replace(/-/g, '/');
+      extractedPath = decodeProjectNameToPath(projectName);
     } else {
       // Process all JSONL files to collect cwd values
       for (const file of jsonlFiles) {
@@ -308,14 +342,21 @@ async function extractProjectDirectory(projectName) {
               const entry = JSON.parse(line);
               
               if (entry.cwd) {
+                let safeCwd;
+                try {
+                  safeCwd = ensurePathWithinAllowedRoots(entry.cwd);
+                } catch {
+                  continue;
+                }
+
                 // Count occurrences of each cwd
-                cwdCounts.set(entry.cwd, (cwdCounts.get(entry.cwd) || 0) + 1);
+                cwdCounts.set(safeCwd, (cwdCounts.get(safeCwd) || 0) + 1);
                 
                 // Track the most recent cwd
                 const timestamp = new Date(entry.timestamp || 0).getTime();
                 if (timestamp > latestTimestamp) {
                   latestTimestamp = timestamp;
-                  latestCwd = entry.cwd;
+                  latestCwd = safeCwd;
                 }
               }
             } catch (parseError) {
@@ -328,7 +369,7 @@ async function extractProjectDirectory(projectName) {
       // Determine the best cwd to use
       if (cwdCounts.size === 0) {
         // No cwd found, fall back to decoded project name
-        extractedPath = projectName.replace(/-/g, '/');
+        extractedPath = decodeProjectNameToPath(projectName);
       } else if (cwdCounts.size === 1) {
         // Only one cwd, use it
         extractedPath = Array.from(cwdCounts.keys())[0];
@@ -352,7 +393,7 @@ async function extractProjectDirectory(projectName) {
         
         // Fallback (shouldn't reach here)
         if (!extractedPath) {
-          extractedPath = latestCwd || projectName.replace(/-/g, '/');
+          extractedPath = latestCwd || decodeProjectNameToPath(projectName);
         }
       }
     }
@@ -365,11 +406,11 @@ async function extractProjectDirectory(projectName) {
   } catch (error) {
     // If the directory doesn't exist, just use the decoded project name
     if (error.code === 'ENOENT') {
-      extractedPath = projectName.replace(/-/g, '/');
+      extractedPath = decodeProjectNameToPath(projectName);
     } else {
       console.error(`Error extracting project directory for ${projectName}:`, error);
       // Fall back to decoded project name for other errors
-      extractedPath = projectName.replace(/-/g, '/');
+      extractedPath = decodeProjectNameToPath(projectName);
     }
     
     // Cache the fallback result too
@@ -1819,6 +1860,7 @@ export {
   loadProjectConfig,
   saveProjectConfig,
   extractProjectDirectory,
+  decodeProjectNameToPath,
   clearProjectDirectoryCache,
   getCodexSessions,
   getCodexSessionMessages,

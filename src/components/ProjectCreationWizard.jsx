@@ -138,11 +138,10 @@ const ProjectCreationWizard = ({ onClose, onProjectCreated }) => {
           params.append('newGithubToken', newGithubToken.trim());
         }
 
-        const token = localStorage.getItem('auth-token');
-        const url = `/api/projects/clone-progress?${params}${token ? `&token=${token}` : ''}`;
+        const url = `/api/projects/clone-progress?${params}`;
 
         await new Promise((resolve, reject) => {
-          const eventSource = new EventSource(url);
+          const eventSource = new EventSource(url, { withCredentials: true });
 
           eventSource.onmessage = (event) => {
             try {

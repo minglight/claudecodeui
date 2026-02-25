@@ -173,6 +173,10 @@ cp .env.example .env
 # Edit .env with your preferred settings
 ```
 
+Required before first start:
+- Set `JWT_SECRET` to a strong random value
+- Keep `ALLOW_LEGACY_QUERY_TOKEN=false` unless you explicitly need legacy SSE auth behavior
+
 4. **Start the application:**
 ```bash
 # Development mode (with hot reload)
