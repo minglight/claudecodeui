@@ -1,0 +1,233 @@
+diff --git a/.env.example b/.env.example
+index 04fa072..6df52b8 100755
+--- a/.env.example
++++ b/.env.example
+@@ -33,8 +33,8 @@ HOST=0.0.0.0
+ # Example: openssl rand -base64 48
+ JWT_SECRET=replace-with-a-strong-random-secret
+ 
+-# JWT expiration (e.g. 15m, 1h, 24h, 7d)
+-JWT_EXPIRES_IN=24h
++# JWT expiration (e.g. 15m, 1h, 24h, 7d, 30d)
++JWT_EXPIRES_IN=30d
+ 
+ # Authentication cookie settings
+ AUTH_COOKIE_NAME=cloudcli_token
+diff --git a/server/middleware/auth.js b/server/middleware/auth.js
+index 290ad83..7068fb5 100644
+--- a/server/middleware/auth.js
++++ b/server/middleware/auth.js
+@@ -4,7 +4,7 @@ import { IS_PLATFORM } from '../constants/config.js';
+ 
+ const INSECURE_DEFAULT_JWT_SECRET = 'claude-ui-dev-secret-change-in-production';
+ const JWT_SECRET = process.env.JWT_SECRET;
+-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '24h';
++const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '30d';
+ const JWT_ALGORITHMS = ['HS256'];
+ const AUTH_COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'cloudcli_token';
+ const ALLOW_LEGACY_QUERY_TOKEN = process.env.ALLOW_LEGACY_QUERY_TOKEN === 'true';
+diff --git a/src/components/chat/hooks/useChatRealtimeHandlers.ts b/src/components/chat/hooks/useChatRealtimeHandlers.ts
+index e84f726..592278b 100644
+--- a/src/components/chat/hooks/useChatRealtimeHandlers.ts
++++ b/src/components/chat/hooks/useChatRealtimeHandlers.ts
+@@ -167,9 +167,10 @@ export function useChatRealtimeHandlers({
+ 
+     const activeViewSessionId =
+       selectedSession?.id || currentSessionId || pendingViewSessionRef.current?.sessionId || null;
++    const isPendingNewClaudeSession =
++      Boolean(pendingViewSessionRef.current) && !pendingViewSessionRef.current?.sessionId;
+     const isSystemInitForView =
+       systemInitSessionId && (!activeViewSessionId || systemInitSessionId === activeViewSessionId);
+-    const shouldBypassSessionFilter = isGlobalMessage || Boolean(isSystemInitForView);
+     const isUnscopedError =
+       !latestMessage.sessionId &&
+       pendingViewSessionRef.current &&
+@@ -177,6 +178,22 @@ export function useChatRealtimeHandlers({
+       (latestMessage.type === 'claude-error' ||
+         latestMessage.type === 'cursor-error' ||
+         latestMessage.type === 'codex-error');
++    const isPendingNewClaudeSessionMessage =
++      isPendingNewClaudeSession &&
++      !latestMessage.sessionId &&
++      new Set([
++        'claude-response',
++        'claude-output',
++        'claude-interactive-prompt',
++        'claude-status',
++        'claude-permission-request',
++        'claude-permission-cancelled',
++        'claude-error',
++      ]).has(String(latestMessage.type));
++    // Claude can emit interactive permission/question events before the SDK exposes session_id.
++    // If we filter those out, the UI stays stuck on "Processing" with no visible prompt.
++    const shouldBypassSessionFilter =
++      isGlobalMessage || Boolean(isSystemInitForView) || isPendingNewClaudeSessionMessage || isUnscopedError;
+ 
+     const handleBackgroundLifecycle = (sessionId?: string) => {
+       if (!sessionId) {
+@@ -558,7 +575,32 @@ export function useChatRealtimeHandlers({
+         );
+         break;
+ 
+-      case 'claude-error':
++      case 'claude-error': {
++        const pendingSessionId = sessionStorage.getItem('pendingSessionId');
++
++        if (streamTimerRef.current) {
++          clearTimeout(streamTimerRef.current);
++          streamTimerRef.current = null;
++        }
++        if (streamBufferRef.current) {
++          appendStreamingChunk(setChatMessages, streamBufferRef.current, false);
++          streamBufferRef.current = '';
++        }
++        finalizeStreamingMessage(setChatMessages);
++        clearLoadingIndicators();
++        markSessionsAsCompleted(
++          latestMessage.sessionId,
++          currentSessionId,
++          selectedSession?.id,
++          pendingSessionId,
++        );
++        if (pendingSessionId) {
++          sessionStorage.removeItem('pendingSessionId');
++        }
++        if (!latestMessage.sessionId) {
++          pendingViewSessionRef.current = null;
++        }
++        setPendingPermissionRequests([]);
+         setChatMessages((previous) => [
+           ...previous,
+           {
+@@ -568,6 +610,7 @@ export function useChatRealtimeHandlers({
+           },
+         ]);
+         break;
++      }
+ 
+       case 'cursor-system':
+         try {
+diff --git a/src/contexts/WebSocketContext.tsx b/src/contexts/WebSocketContext.tsx
+index d5d217f..b504b70 100644
+--- a/src/contexts/WebSocketContext.tsx
++++ b/src/contexts/WebSocketContext.tsx
+@@ -27,37 +27,59 @@ const buildWebSocketUrl = () => {
+ 
+ const useWebSocketProviderState = (): WebSocketContextType => {
+   const wsRef = useRef<WebSocket | null>(null);
+-  const unmountedRef = useRef(false); // Track if component is unmounted
++  const unmountedRef = useRef(false);
++  const shouldReconnectRef = useRef(true);
+   const [latestMessage, setLatestMessage] = useState<any>(null);
+   const [isConnected, setIsConnected] = useState(false);
+   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+   const { token } = useAuth();
+ 
+   useEffect(() => {
++    unmountedRef.current = false;
++    shouldReconnectRef.current = true;
+     connect();
+-    
++
+     return () => {
+-      unmountedRef.current = true;
++      shouldReconnectRef.current = false;
+       if (reconnectTimeoutRef.current) {
+         clearTimeout(reconnectTimeoutRef.current);
++        reconnectTimeoutRef.current = null;
+       }
+       if (wsRef.current) {
+         wsRef.current.close();
++        wsRef.current = null;
+       }
+     };
+   }, [token]); // everytime token changes, we reconnect
+ 
++  useEffect(() => {
++    return () => {
++      unmountedRef.current = true;
++      shouldReconnectRef.current = false;
++      if (reconnectTimeoutRef.current) {
++        clearTimeout(reconnectTimeoutRef.current);
++        reconnectTimeoutRef.current = null;
++      }
++    };
++  }, []);
++
+   const connect = useCallback(() => {
+     if (unmountedRef.current) return; // Prevent connection if unmounted
++    if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
++      return;
++    }
+     try {
+       // Construct WebSocket URL
+       const wsUrl = buildWebSocketUrl();
+-      
+       const websocket = new WebSocket(wsUrl);
++      wsRef.current = websocket;
+ 
+       websocket.onopen = () => {
++        if (unmountedRef.current) {
++          websocket.close();
++          return;
++        }
+         setIsConnected(true);
+-        wsRef.current = websocket;
+       };
+ 
+       websocket.onmessage = (event) => {
+@@ -70,12 +92,23 @@ const useWebSocketProviderState = (): WebSocketContextType => {
+       };
+ 
+       websocket.onclose = () => {
++        if (wsRef.current !== websocket) {
++          return;
++        }
++
+         setIsConnected(false);
+         wsRef.current = null;
+-        
++
++        if (!shouldReconnectRef.current || unmountedRef.current) {
++          return;
++        }
++
+         // Attempt to reconnect after 3 seconds
++        if (reconnectTimeoutRef.current) {
++          clearTimeout(reconnectTimeoutRef.current);
++        }
+         reconnectTimeoutRef.current = setTimeout(() => {
+-          if (unmountedRef.current) return; // Prevent reconnection if unmounted
++          if (unmountedRef.current || !shouldReconnectRef.current) return;
+           connect();
+         }, 3000);
+       };
+diff --git a/src/utils/api.js b/src/utils/api.js
+index 326efe1..f3e3a76 100644
+--- a/src/utils/api.js
++++ b/src/utils/api.js
+@@ -22,6 +22,24 @@ export const authenticatedFetch = (url, options = {}) => {
+       ...defaultHeaders,
+       ...options.headers,
+     },
++  }).then((response) => {
++    if (response.status === 401 || response.status === 403) {
++      // Token expired or invalid – clean up and force re-login
++      try {
++        localStorage.removeItem('auth-token');
++        sessionStorage.setItem('authError', 'Session expired, please sign in again.');
++      } catch (e) {
++        // ignore storage errors
++      }
++
++      if (!window.location.pathname.includes('/login')) {
++        window.location.href = '/login';
++      }
++
++      throw new Error('Unauthorized or expired session');
++    }
++
++    return response;
+   });
+ };
+ 
