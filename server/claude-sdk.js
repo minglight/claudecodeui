@@ -18,6 +18,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
 import { CLAUDE_MODELS } from '../shared/modelConstants.js';
+import { isSecretaryWorkspace, recallBlock } from './secretary-memory.js';
 
 const activeSessions = new Map();
 const pendingToolApprovals = new Map();
@@ -476,6 +477,22 @@ async function queryClaudeSDK(command, options = {}, ws) {
     const finalCommand = imageResult.modifiedCommand;
     tempImagePaths = imageResult.tempImagePaths;
     tempDir = imageResult.tempDir;
+
+    // --- AI Secretary memory bridge (方案 B, read) — NO-OP outside the secretary
+    // chat workspace. Recall memory relevant to THIS utterance and inject it via
+    // systemPrompt.append (fresh on every turn). The write side is batched: a
+    // secretary ritual consolidates these sessions' transcripts into memory
+    // periodically, so there is no per-turn write hook here. ---
+    if (isSecretaryWorkspace(options.cwd)) {
+      const memBlock = await recallBlock(finalCommand);
+      if (memBlock) {
+        sdkOptions.systemPrompt = {
+          ...(sdkOptions.systemPrompt || { type: 'preset', preset: 'claude_code' }),
+          append: memBlock,
+        };
+        console.log(`[secretary-memory] injected ${memBlock.length} chars into systemPrompt.append`);
+      }
+    }
 
     sdkOptions.canUseTool = async (toolName, input, context) => {
       const requiresInteraction = TOOLS_REQUIRING_INTERACTION.has(toolName);
